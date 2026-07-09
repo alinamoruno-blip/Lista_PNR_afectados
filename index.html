@@ -474,6 +474,56 @@ processBtn.addEventListener('click', async () => {
     });
     if (wantedCols.length === 0) throw new Error('No se encontraron las columnas requeridas para CONTACTOS A NOTIFCAR.');
 
+    // índices (dentro de wantedCols) que corresponden a columnas "AP*"
+    const apPositions = [];
+    wantedCols.forEach((srcCi, idx) => {
+      const name = (headers[srcCi - 1] || '').toString();
+      if (name.startsWith('AP')) apPositions.push(idx);
+    });
+
+    // normaliza un valor de celda a texto plano para comparar/inspeccionar
+    function cellToText(val){
+      if (val === null || val === undefined) return '';
+      if (typeof val === 'object'){
+        if (val.richText) return val.richText.map(rt => rt.text).join('');
+        if (val.text) return val.text.toString();
+        if (val.result !== undefined) return val.result.toString();
+        return JSON.stringify(val);
+      }
+      return val.toString();
+    }
+    const hasDigitOrAt = txt => /[0-9@]/.test(txt);
+
+    // recolecta las filas candidatas (valores + referencia a la fila fuente en Afectados)
+    const candidateRows = [];
+    for (let r = 2; r <= lastAfRow; r++){
+      const values = wantedCols.map(srcCi => cellToText(wsAf.getRow(r).getCell(srcCi).value));
+      candidateRows.push({ srcRow: r, values });
+    }
+
+    // 1) eliminar filas duplicadas (misma información en todas las columnas seleccionadas)
+    const seen = new Set();
+    let duplicatesRemoved = 0;
+    const dedupedRows = [];
+    for (const row of candidateRows){
+      const key = row.values.join('\u0001');
+      if (seen.has(key)){
+        duplicatesRemoved++;
+        continue;
+      }
+      seen.add(key);
+      dedupedRows.push(row);
+    }
+
+    // 2) eliminar filas sin ningún dato de contacto válido (ninguna columna AP tiene número o @)
+    let noContactRemoved = 0;
+    const finalRows = dedupedRows.filter(row => {
+      if (apPositions.length === 0) return true; // no hay columnas AP, no se filtra por esto
+      const hasContact = apPositions.some(pos => hasDigitOrAt(row.values[pos]));
+      if (!hasContact) noContactRemoved++;
+      return hasContact;
+    });
+
     const wsCt = wb.addWorksheet('CONTACTOS A NOTIFCAR', { views: [{ state: 'frozen', ySplit: 1 }] });
     wantedCols.forEach((srcCi, idx) => {
       const dstCi = idx + 1;
@@ -485,15 +535,16 @@ processBtn.addEventListener('click', async () => {
     });
     wsCt.getRow(1).height = wsAf.getRow(1).height;
 
-    for (let r = 2; r <= lastAfRow; r++){
+    finalRows.forEach((row, i) => {
+      const destRowIdx = i + 2;
       wantedCols.forEach((srcCi, idx) => {
         const dstCi = idx + 1;
-        const src = wsAf.getRow(r).getCell(srcCi);
-        const dst = wsCt.getRow(r).getCell(dstCi);
+        const src = wsAf.getRow(row.srcRow).getCell(srcCi);
+        const dst = wsCt.getRow(destRowIdx).getCell(dstCi);
         dst.value = src.value;
         applyStyle(dst, cloneStyle(src));
       });
-    }
+    });
 
     log(`Afectados: ${matchedCount} pasajeros coincidentes.`, 'line-ok');
     if (noMatchList.length){
@@ -501,6 +552,13 @@ processBtn.addEventListener('click', async () => {
     } else {
       log('Todos los PNR tuvieron coincidencia.', 'line-ok');
     }
+    if (duplicatesRemoved){
+      log(`CONTACTOS A NOTIFCAR: ${duplicatesRemoved} fila(s) duplicada(s) eliminada(s).`, 'line-warn');
+    }
+    if (noContactRemoved){
+      log(`CONTACTOS A NOTIFCAR: ${noContactRemoved} fila(s) sin dato de contacto válido en columnas AP eliminada(s).`, 'line-warn');
+    }
+    log(`CONTACTOS A NOTIFCAR: ${finalRows.length} fila(s) final(es).`, 'line-ok');
     log('Generando archivo de salida...');
 
     const outBuffer = await wb.xlsx.writeBuffer();
